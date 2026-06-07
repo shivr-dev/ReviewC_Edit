@@ -633,6 +633,23 @@ export default function BankBuilderPage() {
                   智能自动去重
                 </button>
               </div>
+              <div className="mt-2">
+                <button className="btn btn-outline border-orange-200 text-orange-500 hover:bg-orange-50 !p-1.5 text-xs w-full truncate" onClick={() => {
+                  const newItems = items.map(item => {
+                    if (item.a && !item.q) {
+                      return { ...item, q: pinyin(item.a) };
+                    } else if (item.a && item.q.trim() !== '') {
+                        // if user wants to overwrite? we will simply overwrite all
+                        return { ...item, q: pinyin(item.a) };
+                    }
+                    return item;
+                  });
+                  setItems(newItems);
+                  toast("已根据所有答案生成拼音作为题目", "success");
+                }} title="批量将所有题目的问题替换为答案的拼音">
+                  全局智能拼音
+                </button>
+              </div>
             </div>
           </div>
         </div>
