@@ -28,7 +28,17 @@ export default function BankBuilderPage() {
   const [showAIModal, setShowAIModal] = useState(false);
   const [aiPrompt, setAiPrompt] = useState('');
   const [cfAccountId, setCfAccountId] = useState(() => localStorage.getItem('cfAccountId') || '');
+  const [cfToken, setCfToken] = useState(() => localStorage.getItem('cfToken') || 'cfut_TbqHfokK5npH4ou57VMvdfCAkWb5X6wG19Z9kzVKf23f75a0');
+  const [cfMaxTokens, setCfMaxTokens] = useState(() => localStorage.getItem('cfMaxTokens') || '4096');
   const [isGenerating, setIsGenerating] = useState(false);
+  const [showCodePreview, setShowCodePreview] = useState(false);
+  const [generatedCode, setGeneratedCode] = useState('');
+  const [previewAiItems, setPreviewAiItems] = useState<DictationItem[]>([]);
+  const [activeTab, setActiveTab] = useState<'visual'|'code'>('visual');
+  const [aiStreamRaw, setAiStreamRaw] = useState('');
+  const [aiHistory, setAiHistory] = useState<any[]>([]);
+  const [aiFollowUp, setAiFollowUp] = useState('');
+  const streamRef = useRef<HTMLDivElement>(null);
 
   const addItem = () => {
     setItems([...items, { q: '', a: '', cat: '自定义' }]);
@@ -212,54 +222,257 @@ export default function BankBuilderPage() {
     }
   };
 
-  const handleAIGenerate = async () => {
+  const renderStream = () => {
+    if (!aiStreamRaw) return '等待响应...';
+    const hasThink = aiStreamRaw.includes('<think>');
+    if (!hasThink) return aiStreamRaw;
+    
+    const parts = aiStreamRaw.split('<think>');
+    if (parts.length <= 1) return aiStreamRaw;
+    
+    const afterThinkOpen = parts[1];
+    const thinkParts = afterThinkOpen.split('</think>');
+    const thinkContent = thinkParts[0];
+    const restContent = thinkParts[1] || '';
+    
+    return (
+      <div className="flex flex-col gap-2 pointer-events-auto">
+        <div className="text-[var(--sub)] bg-[var(--brand)]/5 p-2 rounded border border-[var(--brand)]/20">
+          <strong className="text-[var(--brand)] mb-1 block">🤔 思考过程：</strong>
+          {thinkContent}
+        </div>
+        {restContent && (
+          <div className="p-2">
+            <strong className="text-[var(--title)] mb-1 block">✨ 生成内容：</strong>
+            {restContent}
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  const handleAIGenerate = async (isFollowUp = false) => {
     if (!cfAccountId.trim()) {
       toast("需要提供 Cloudflare Account ID 才能调用 AI", "error");
       return;
     }
-    if (!aiPrompt.trim()) {
+    const currentInput = isFollowUp ? aiFollowUp.trim() : aiPrompt.trim();
+    if (!currentInput) {
       toast("请输入想要生成的内容指令", "error");
       return;
     }
 
+    if (!cfToken.trim()) {
+      toast("需要提供 Cloudflare API Token 才能调用 AI", "error");
+      return;
+    }
+
     localStorage.setItem('cfAccountId', cfAccountId.trim());
+    localStorage.setItem('cfToken', cfToken.trim());
+    localStorage.setItem('cfMaxTokens', cfMaxTokens.toString());
     setIsGenerating(true);
-    showLoader("AI 思考中，预计 5~15 秒...");
+    setAiStreamRaw('');
     
+    let currentHistory = [...aiHistory];
+    
+    if (!isFollowUp) {
+       currentHistory = [
+          { 
+            role: 'system', 
+            content: 'You are a JavaScript automated generator. Output strictly a valid JavaScript code block that returns an array of objects. The array must contain objects with exactly these keys: `q` (question text), `a` (answer text), `cat` (category string). Example structure:\n```javascript\nreturn [\n  { q: "1+1=", a: "2", cat: "Math" }\n];\n```\nInclude no other text or explanation unless it is within a <think> element if you choose to reason first. The final evaluated expression inside the code must return this array. IMPORTANT: You must output a complete array, do not get cut off.' 
+          },
+          { 
+            role: 'user', 
+            content: currentInput
+          }
+       ];
+    } else {
+       currentHistory.push({ role: 'user', content: currentInput });
+    }
+    setAiHistory(currentHistory);
+
     try {
-      const res = await fetch('/api/generate-questions', {
+      const url = `https://api.cloudflare.com/client/v4/accounts/${cfAccountId.trim()}/ai/v1/chat/completions`;
+      const proxyUrl = `https://corsproxy.io/?${encodeURIComponent(url)}`;
+      
+      const aiResponse = await fetch(proxyUrl, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Authorization': `Bearer ${cfToken.trim()}`,
+          'Content-Type': 'application/json'
+        },
         body: JSON.stringify({
-          prompt: aiPrompt,
-          accountId: cfAccountId.trim(),
-        }),
+          model: '@cf/qwen/qwen2.5-coder-32b-instruct',
+          messages: currentHistory,
+          max_tokens: parseInt(cfMaxTokens) || 4096,
+          stream: true
+        })
       });
 
-      const data = await res.json();
-      
-      if (!res.ok) {
-        throw new Error(data.error || 'API 请求失败');
+      if (!aiResponse.ok) {
+        let errText = await aiResponse.text();
+        try { errText = JSON.stringify(JSON.parse(errText)); } catch(e) {}
+        throw new Error(`Cloudflare API Error: ${errText}`);
       }
 
-      if (data.result && Array.isArray(data.result)) {
-        setItems(prev => [...prev, ...data.result]);
-        toast(`成功生成 ${data.result.length} 道题目`, "success");
+      const reader = aiResponse.body?.getReader();
+      const decoder = new TextDecoder('utf-8');
+      let aiContent = '';
+
+      if (reader) {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          const chunk = decoder.decode(value, { stream: true });
+          const lines = chunk.split('\n');
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+               const dataStr = line.substring(6).trim();
+               if (dataStr === '[DONE]') continue;
+               try {
+                 const data = JSON.parse(dataStr);
+                 const text = data?.choices?.[0]?.delta?.content || data?.response || '';
+                 aiContent += text;
+                 setAiStreamRaw(aiContent);
+                 setTimeout(() => {
+                   if (streamRef.current) streamRef.current.scrollTop = streamRef.current.scrollHeight;
+                 }, 0);
+               } catch(e) {}
+            }
+          }
+        }
+      }
+
+      // After streaming
+      setAiHistory(prev => [...prev, { role: 'assistant', content: aiContent }]);
+
+      // Pre-process thinking block if any
+      let cleanContent = aiContent.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
+      if (cleanContent.includes('<think>')) {
+        cleanContent = cleanContent.split('<think>')[0].trim();
+      }
+
+      // Extract javascript block if any
+      const jsMatch = cleanContent.match(/```(?:javascript|js|json)\n([\s\S]*?)(?:\n```|$)/);
+      let jsCode = jsMatch ? jsMatch[1].trim() : cleanContent.trim();
+      
+      // Also try to strip non-code prefix/suffix if backticks missed
+      if (!jsMatch && jsCode.includes('return [')) {
+         jsCode = jsCode.substring(jsCode.indexOf('return ['));
+      }
+      if (!jsMatch && jsCode.trim().startsWith('[')) {
+         jsCode = 'return ' + jsCode.trim();
+      }
+
+      const tryParse = (codeStr: string) => {
+        try {
+          const fn = new Function(`return (function(){ ${codeStr.includes('return') ? codeStr : 'return ' + codeStr} })()`);
+          return fn();
+        } catch(e) {
+          return null;
+        }
+      };
+
+      let parsedItems: any[] = [];
+      let res = tryParse(jsCode);
+      if (Array.isArray(res)) {
+         parsedItems = res;
+      } else {
+         // Auto-fix for cut-off code
+         const fixes = [
+           "}]",
+           "\"}]",
+           "'}]",
+           "\", cat: \"未分类\"}]",
+           "', cat: '未分类'}]",
+           "\"}, {q:\"未完整\", a:\"已截断\", cat:\"未分类\"}]"
+         ];
+         let fixed = false;
+         for (let fix of fixes) {
+            let attempt = tryParse(jsCode + fix);
+            if (Array.isArray(attempt)) {
+               parsedItems = attempt;
+               jsCode = jsCode + fix;
+               fixed = true;
+               break;
+            }
+         }
+         
+         if (!fixed) {
+           let tryArray = tryParse("return " + jsCode + "]");
+           if (Array.isArray(tryArray)) {
+              parsedItems = tryArray;
+              jsCode = "return " + jsCode + "]";
+           }
+         }
+      }
+
+      setGeneratedCode(jsCode);
+      
+      if (parsedItems.length > 0) {
+        setPreviewAiItems(parsedItems);
+        setActiveTab('visual');
+      } else {
+        setPreviewAiItems([]);
+        setActiveTab('code');
+      }
+
+      setShowCodePreview(true);
+      setShowAIModal(false);
+      if (isFollowUp) {
+        setAiFollowUp('');
+      } else {
         setAiPrompt('');
-        setShowAIModal(false);
+      }
+      toast("AI 已生成内容，请预览并确认", "success");
+
+    } catch (e: any) {
+      toast("AI 生成失败: " + e.message, "error");
+    } finally {
+      setIsGenerating(false);
+    }
+  };
+
+  const handleExecuteCode = () => {
+    try {
+      const fn = new Function(`
+        try {
+          ${generatedCode}
+        } catch(e) {
+          throw new Error("执行代码报错: " + e.message);
+        }
+      `);
+      const result = fn();
+      
+      if (Array.isArray(result) && result.length > 0 && result[0].hasOwnProperty('q') && result[0].hasOwnProperty('a')) {
+        setItems(prev => [...prev, ...result]);
+        toast(`成功添加 ${result.length} 道题目`, "success");
+        setShowCodePreview(false);
+        setGeneratedCode('');
+        setPreviewAiItems([]);
         setTimeout(() => {
           if (listRef.current) {
             listRef.current.scrollTop = listRef.current.scrollHeight;
           }
         }, 100);
       } else {
-        throw new Error('返回的数据格式异常');
+        throw new Error('代码未返回有效的题目数组格式！');
       }
-    } catch (e: any) {
-      toast("AI 生成失败: " + e.message, "error");
-    } finally {
-      setIsGenerating(false);
-      hideLoader();
+    } catch(e: any) {
+      toast(e.message, "error");
+    }
+  };
+
+  // Re-evaluate when code changes in code tab
+  const handleCodeChange = (e: any) => {
+    const newCode = e.target.value;
+    setGeneratedCode(newCode);
+    try {
+      const fn = new Function(`return (function(){ ${newCode} })()`);
+      const res = fn();
+      if (Array.isArray(res)) setPreviewAiItems(res);
+    } catch(err) {
+      // ignore
     }
   };
 
@@ -362,14 +575,62 @@ export default function BankBuilderPage() {
                 className="w-full text-xs font-mono p-3 bg-[var(--card)] border border-[var(--border)] rounded-lg outline-none mb-3 resize-none focus:border-[var(--brand)] transition-colors shadow-inner"
               />
               <div className="flex gap-2">
-                <button className="btn btn-outline !p-2 text-sm w-1/2 font-medium" onClick={handleImportJson}>
+                <button className="btn btn-outline !p-2 text-sm w-1/3 font-medium flex-1 truncate" onClick={handleImportJson} title="解析输入框中的文本/JSON">
                   解析并导入
                 </button>
-                <button className="btn btn-outline !p-2 text-sm w-1/2 font-medium" onClick={() => {
+                <button className="btn btn-outline !p-2 text-sm w-1/3 font-medium flex-1 truncate" onClick={() => {
                   setImportJson(JSON.stringify(items, null, 2));
-                  toast("已将当前题库转为 JSON，您可以复制保存", "success");
-                }}>
-                  生成 JSON
+                  toast("已将当前题库转为 JSON，您可以复制或编辑", "success");
+                }} title="将当前题库生成为JSON">
+                  JSON提取
+                </button>
+                <button className="btn btn-outline !p-2 text-sm w-1/3 font-medium flex-1 truncate" onClick={() => {
+                  const txt = items.filter(i => i.q.trim() || i.a.trim()).map(i => `${i.q} - ${i.a}`).join('\n');
+                  if (!txt) return toast("没有可提取的内容", "error");
+                  setImportJson(txt);
+                  toast("已将当前题库提取为纯文本，您可以复制或编辑", "success");
+                }} title="将当前题库生成为文本格式">
+                  文本提取
+                </button>
+              </div>
+              <div className="grid grid-cols-2 gap-2 mt-2">
+                <button className="btn btn-outline hover:bg-[var(--bg2)] text-[var(--sub)] hover:text-[var(--title)] !p-1.5 text-xs w-full truncate border-[var(--border)]" onClick={() => {
+                  const cleaned = items.filter(i => i.q.trim() || i.a.trim());
+                  if (cleaned.length === items.length) return toast("没有空行需要清理", "success");
+                  if (cleaned.length === 0) return toast("清理后将没有题目，请直接使用清空功能", "error");
+                  setItems(cleaned);
+                  setPreviewIndex(0);
+                  toast(`清理了 ${items.length - cleaned.length} 个空行`, "success");
+                }} title="清除没有问题和答案的内容">
+                  清理所有空白行
+                </button>
+                <button className="btn btn-outline hover:bg-[var(--bg2)] text-[var(--sub)] hover:text-[var(--title)] !p-1.5 text-xs w-full truncate border-[var(--border)]" onClick={() => {
+                  const reversed = [...items].map(i => ({ ...i, q: i.a, a: i.q }));
+                  setItems(reversed);
+                  toast("已全局互换题目和答案", "success");
+                }} title="将所有题目的问题与答案互相调换">
+                  全局问答对调
+                </button>
+                <button className="btn btn-outline hover:bg-[var(--bg2)] text-[var(--sub)] hover:text-[var(--title)] !p-1.5 text-xs w-full truncate border-[var(--border)]" onClick={() => {
+                  const shuffled = [...items].sort(() => Math.random() - 0.5);
+                  setItems(shuffled);
+                  toast("已打乱题目顺序", "success");
+                }} title="随机打乱题目顺序">
+                  全局随机打乱
+                </button>
+                <button className="btn btn-outline hover:bg-[var(--bg2)] text-[var(--sub)] hover:text-[var(--title)] !p-1.5 text-xs w-full truncate border-[var(--border)]" onClick={() => {
+                  const map = new Map();
+                  items.forEach(item => {
+                    const key = item.q.trim();
+                    if (key && !map.has(key)) map.set(key, item);
+                  });
+                  const deduplicated = Array.from(map.values()) as DictationItem[];
+                  if (deduplicated.length === items.length) return toast("没有发现重复项", "success");
+                  setItems(deduplicated);
+                  setPreviewIndex(Math.min(previewIndex, deduplicated.length - 1));
+                  toast(`去重完成，移除了 ${items.length - deduplicated.length} 个重复问题`, "success");
+                }} title="移除问题完全相同的重复题目">
+                  智能自动去重
                 </button>
               </div>
             </div>
@@ -505,11 +766,48 @@ export default function BankBuilderPage() {
                   disabled={isGenerating}
                 />
                 <div className="text-[10px] text-[var(--sub)] mt-1 ml-1 text-red-500">
-                  调用模型的必需参数（将保存在本地）
+                  调用模型的必需参数（将保存在浏览器本地缓存）
+                </div>
+              </div>
+              <div className="pt-2 flex gap-4">
+                <div className="flex-1 min-w-0">
+                  <label className="set-label font-medium mb-2 block flex items-center justify-between">
+                    <span>2. Cloudflare AI Token</span>
+                    <a href="https://dash.cloudflare.com/profile/api-tokens" target="_blank" rel="noreferrer" className="text-[10px] text-[var(--brand)] hover:underline whitespace-nowrap ml-2">去获取 Token</a>
+                  </label>
+                  <input 
+                    type="text"
+                    value={cfToken}
+                    onChange={e => setCfToken(e.target.value)}
+                    className="w-full text-sm p-3 bg-[var(--bg2)] rounded-lg outline-none focus:ring-1 ring-[var(--brand)] transition-shadow border border-[var(--border)]"
+                    placeholder="请输入您的 Token (以 cfut_ 等开头)"
+                    disabled={isGenerating}
+                  />
+                  <div className="text-[10px] text-[var(--sub)] mt-1 ml-1 leading-relaxed">
+                    需要创建自定义 API Token，并授予 <strong>Account {">"} Workers AI {">"} Read</strong> 权限。
+                  </div>
+                </div>
+                <div className="w-28 shrink-0">
+                  <label className="set-label font-medium mb-2 block truncate" title="调整最大生成长度，防止长文本被截断">Max Tokens</label>
+                  <input 
+                    type="number"
+                    value={cfMaxTokens}
+                    onChange={e => setCfMaxTokens(e.target.value)}
+                    className="w-full text-sm p-3 bg-[var(--bg2)] rounded-lg outline-none focus:ring-1 ring-[var(--brand)] transition-shadow border border-[var(--border)]"
+                    placeholder="4096"
+                    disabled={isGenerating}
+                  />
                 </div>
               </div>
               <div className="pt-2">
-                <label className="set-label font-medium mb-2 block">2. 生成指令</label>
+                <div className="flex justify-between items-end mb-2 block">
+                  <label className="set-label font-medium mb-0">3. 生成指令</label>
+                  <div className="flex gap-2">
+                    <button onClick={() => setAiPrompt("生成5道关于中国历史的知识问答题。")} className="text-[10px] text-[var(--brand)] bg-[var(--brand)]/10 px-2 py-1 rounded hover:bg-[var(--brand)]/20 transition-colors">历史题</button>
+                    <button onClick={() => setAiPrompt("生成5道高中常考英语单词及其中文翻译。")} className="text-[10px] text-[var(--brand)] bg-[var(--brand)]/10 px-2 py-1 rounded hover:bg-[var(--brand)]/20 transition-colors">英语单词</button>
+                    <button onClick={() => setAiPrompt("生成5道基础物理常识问答题。")} className="text-[10px] text-[var(--brand)] bg-[var(--brand)]/10 px-2 py-1 rounded hover:bg-[var(--brand)]/20 transition-colors">常识题</button>
+                  </div>
+                </div>
                 <textarea 
                   value={aiPrompt}
                   onChange={e => setAiPrompt(e.target.value)}
@@ -518,13 +816,146 @@ export default function BankBuilderPage() {
                   disabled={isGenerating}
                 />
               </div>
+              
+              {isGenerating && (
+                <div className="mt-4 p-4 bg-[var(--bg)] border border-[var(--border)] rounded-xl animate-in fade-in duration-300">
+                  <div className="text-sm font-medium text-[var(--brand)] mb-2 flex items-center gap-2">
+                    <div className="w-4 h-4 rounded-full border-2 border-[var(--brand)] border-t-transparent animate-spin"></div>
+                    AI 正在思考并输出...
+                  </div>
+                  <div 
+                    ref={streamRef}
+                    className="text-[11px] text-[var(--sub)] font-mono overflow-y-auto h-32 max-h-32 whitespace-pre-wrap p-2 bg-[var(--bg2)] rounded border border-[var(--border)] pointer-events-auto"
+                  >
+                    {renderStream()}
+                  </div>
+                </div>
+              )}
+
+              {!isGenerating && (
+                <button 
+                  className="btn btn-primary w-full py-3 mt-4 text-[14px] font-medium" 
+                  onClick={() => handleAIGenerate(false)}
+                >
+                  提交指令
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Code Preview Modal */}
+      {showCodePreview && (
+        <div className="fixed inset-0 z-[4000] bg-black/40 flex items-center justify-center p-4">
+          <div className="bg-[var(--card)] w-full max-w-2xl rounded-2xl p-6 relative shadow-[0_16px_48px_rgba(0,0,0,0.15)] animate-in zoom-in-95 duration-200">
+            <div className="flex justify-between items-center mb-4 border-b border-[var(--border)] pb-3">
+              <h3 className="text-xl font-serif font-medium flex items-center gap-2 text-[var(--title)]">
+                <Sparkles size={20} className="text-[var(--brand)]"/> AI 生成预览 ({previewAiItems.length})
+              </h3>
+              <button onClick={() => setShowCodePreview(false)} className="text-[var(--sub)] hover:text-[var(--title)]"><X size={20}/></button>
+            </div>
+            
+            <div className="flex gap-4 border-b border-[var(--border)] mb-4 pb-0">
               <button 
-                className="btn btn-primary w-full py-3 mt-4 text-[14px] font-medium" 
-                onClick={handleAIGenerate}
-                disabled={isGenerating}
+                className={`pb-2 px-1 text-sm font-medium border-b-2 transition-colors ${activeTab === 'visual' ? 'border-[var(--brand)] text-[var(--brand)]' : 'border-transparent text-[var(--sub)] hover:text-[var(--title)]'}`}
+                onClick={() => setActiveTab('visual')}
               >
-                {isGenerating ? '正在生成中，请耐心等待...' : '提交指令'}
+                列表预览
               </button>
+              <button 
+                className={`pb-2 px-1 text-sm font-medium border-b-2 transition-colors ${activeTab === 'code' ? 'border-[var(--brand)] text-[var(--brand)]' : 'border-transparent text-[var(--sub)] hover:text-[var(--title)]'}`}
+                onClick={() => setActiveTab('code')}
+              >
+                高级：查看源码
+              </button>
+            </div>
+
+            <div className="space-y-4">
+              {activeTab === 'visual' ? (
+                 <div className="h-64 overflow-y-auto space-y-3 pr-2 scrollbar-custom bg-[var(--bg)] p-3 rounded-xl border border-[var(--border)]">
+                   {previewAiItems.length > 0 ? previewAiItems.map((item, idx) => (
+                     <div key={idx} className="bg-[var(--card)] p-3 rounded-lg shadow-sm border border-[var(--border)] flex flex-col gap-2">
+                       <div className="flex justify-between items-start">
+                         <div className="text-sm font-medium text-[var(--title)] flex-1">{item.q}</div>
+                         <div className="text-[10px] text-[var(--brand)] bg-[var(--brand)]/10 px-2 py-0.5 rounded-full ml-2 w-max shrink-0">{item.cat}</div>
+                       </div>
+                       <div className="text-sm text-[var(--sub)] border-t border-[var(--border)] pt-2 mt-1">
+                         A: {item.a}
+                       </div>
+                     </div>
+                   )) : (
+                     <div className="flex items-center justify-center h-full text-sm text-[var(--sub)]">
+                       未提取到有效题目结构，请查看大模型输出源码或重试。
+                     </div>
+                   )}
+                 </div>
+              ) : (
+                <div className="pt-2">
+                  <textarea 
+                    value={generatedCode}
+                    onChange={handleCodeChange}
+                    className="w-full text-xs font-mono p-4 bg-[var(--bg)] border border-[var(--border)] rounded-xl outline-none resize-none h-64 focus:border-[var(--brand)] transition-colors"
+                    spellCheck={false}
+                  />
+                </div>
+              )}
+              
+              {isGenerating ? (
+                <div className="mt-4 p-4 bg-[var(--bg)] border border-[var(--border)] rounded-xl animate-in fade-in duration-300">
+                  <div className="text-sm font-medium text-[var(--brand)] mb-2 flex items-center gap-2">
+                    <div className="w-4 h-4 rounded-full border-2 border-[var(--brand)] border-t-transparent animate-spin"></div>
+                    AI 正在思考并修正...
+                  </div>
+                  <div 
+                    ref={streamRef}
+                    className="text-[11px] text-[var(--sub)] font-mono overflow-y-auto h-32 max-h-32 whitespace-pre-wrap p-2 bg-[var(--bg2)] rounded border border-[var(--border)] pointer-events-auto"
+                  >
+                    {renderStream()}
+                  </div>
+                </div>
+              ) : (
+                <>
+                  <div className="flex gap-3 mt-4 pt-2">
+                    <button 
+                      className="btn btn-outline flex-1 py-3" 
+                      onClick={() => setShowCodePreview(false)}
+                    >
+                      取消并废弃
+                    </button>
+                    <button 
+                      className="btn btn-primary flex-1 py-3 font-medium" 
+                      onClick={handleExecuteCode}
+                      disabled={previewAiItems.length === 0}
+                    >
+                      确认导入这 {previewAiItems.length} 道题
+                    </button>
+                  </div>
+
+                  <div className="mt-4 pt-4 border-t border-[var(--border)]">
+                    <label className="set-label font-medium mb-2 block">对结果不满意？让 AI 继续修改：</label>
+                    <div className="flex gap-2">
+                      <input 
+                        type="text" 
+                        value={aiFollowUp}
+                        onChange={e => setAiFollowUp(e.target.value)}
+                        placeholder="例如：稍微难一点、再加两道题..."
+                        className="flex-1 text-sm p-3 bg-[var(--bg2)] rounded-lg outline-none focus:ring-1 ring-[var(--brand)] transition-shadow border border-[var(--border)]"
+                        onKeyDown={e => {
+                          if (e.key === 'Enter' && aiFollowUp.trim()) handleAIGenerate(true);
+                        }}
+                      />
+                      <button 
+                        className="btn btn-primary !px-6"
+                        onClick={() => handleAIGenerate(true)}
+                        disabled={!aiFollowUp.trim()}
+                      >
+                        发送修正
+                      </button>
+                    </div>
+                  </div>
+                </>
+              )}
             </div>
           </div>
         </div>
